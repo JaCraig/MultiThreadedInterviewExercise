@@ -2,56 +2,122 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Text;
-using System.Threading;
+using System.Linq;
 using System.Threading.Tasks;
 
 namespace ServiceExercise
 {
+    /// <summary>
+    /// Service class
+    /// </summary>
+    /// <seealso cref="IService"/>
+    /// <seealso cref="IDisposable"/>
     public class Service : IService, IDisposable
     {
-        private List<Task<int>> tasks;
-        int sum;
-        private SemaphoreSlim semaphore;
-        private Connection c;
-        BlockingCollection<Request> q = new BlockingCollection<Request>();
-        bool produceRunning = false;
-        private readonly object produceLock = new object();
+        /// <summary>
+        /// Initializes a new instance of the <see cref="Service"/> class.
+        /// </summary>
+        /// <param name="CONNETION_COUNT">The connection count.</param>
         public Service(int CONNETION_COUNT)
         {
-            sum = 0;
-            c = new Connection();
-            tasks = new List<Task<int>>();
-            semaphore = new SemaphoreSlim(CONNETION_COUNT);
+            Connections = new ConnectionPool(CONNETION_COUNT);
+        }
+
+        /// <summary>
+        /// Finalizes an instance of the <see cref="Service"/> class.
+        /// </summary>
+        ~Service()
+        {
+            Dispose();
+        }
+
+        /// <summary>
+        /// Gets the connections.
+        /// </summary>
+        /// <value>The connections.</value>
+        private ConnectionPool Connections { get; set; }
+
+        /// <summary>
+        /// Gets the requests.
+        /// </summary>
+        /// <value>The requests.</value>
+        private BlockingCollection<Request> Requests { get; set; } = new BlockingCollection<Request>();
+
+        /// <summary>
+        /// Gets or sets a value indicating whether this <see cref="Service"/> is running.
+        /// </summary>
+        /// <value><c>true</c> if running; otherwise, <c>false</c>.</value>
+        private bool Running { get; set; }
+
+        /// <summary>
+        /// Gets the tasks.
+        /// </summary>
+        /// <value>The tasks.</value>
+        private List<Task<int>> Tasks { get; } = new List<Task<int>>();
+
+        /// <summary>
+        /// The lock object
+        /// </summary>
+        private readonly object LockObject = new object();
+
+        /// <summary>
+        /// The finished loading
+        /// </summary>
+        private bool FinishedLoading;
+
+        /// <summary>
+        /// The summary available
+        /// </summary>
+        private bool SummaryAvailable;
+
+        /// <summary>
+        /// Performs application-defined tasks associated with freeing, releasing, or resetting
+        /// unmanaged resources.
+        /// </summary>
+        public void Dispose()
+        {
+            if (Connections is null)
+                return;
+            Connections.Dispose();
+            Connections = null;
+
+            Requests.Dispose();
+            Requests = null;
         }
 
         /// <summary>
         /// returns the sum in the current time of the service
         /// </summary>
-        /// <returns></returns>
+        /// <returns>The sum.</returns>
         public int getSummary()
         {
-            return sum;
+            while (!SummaryAvailable) ;
+            Task.WaitAll(Tasks.ToArray());
+            return Tasks.Sum(x => x.Result);
         }
 
         /// <summary>
-        /// Double check if the queue is empty when we notify that no more loading is done. and dispose the connection
+        /// Notifies the finished loading.
         /// </summary>
         public void notifyFinishedLoading()
         {
-            if (produceRunning == false)
-            {
-                lock (produceLock)
-                {
-                    produceRunning = true;
-                    Produce();
-                    produceRunning = false;
-                }
-            }
-            while (q.Count != 0) ;
-            Task.WaitAll(tasks.ToArray());
+            FinishedLoading = true;
             Console.WriteLine("Finished loading");
-            Dispose();
+        }
+
+        /// <summary>
+        /// Produces this instance.
+        /// </summary>
+        public void Produce()
+        {
+            while (!FinishedLoading || Requests.Count > 0)
+            {
+                if (!Requests.TryTake(out var Request))
+                    continue;
+                Console.WriteLine(Request.Command + " has entered the Produce function");
+                Tasks.Add(Connections.ProcessRequest(Request));
+            }
+            SummaryAvailable = true;
         }
 
         /// <summary>
@@ -60,60 +126,17 @@ namespace ServiceExercise
         /// <param name="request"></param>
         public void sendRequest(Request request)
         {
-            Console.WriteLine(request.Command + " has entered the q");
-            q.Add(request);
-
-
-            if (produceRunning == false)
+            Requests.Add(request);
+            Console.WriteLine(request.Command + " has entered the queue");
+            if (Running)
+                return;
+            lock (LockObject)
             {
-                Task.Run(() =>
-                {
-                    lock (produceLock)
-                    {
-                        Console.WriteLine("------------------------------------------- this is hapaning ---------------------------------------");
-                        produceRunning = true;
-                        Produce();
-                        produceRunning = false;
-                        Console.WriteLine("||||||||||||||||||||||||||||||||||||||||||| this is hapaning |||||||||||||||||||||||||||||||||||||||||||");
-                    }
-                });
+                if (Running)
+                    return;
+                Running = true;
             }
-            
-
-        }
-
-        /// <summary>
-        /// Go over all the requests in the queue, using semaphore so it will use only 4 requests at a time.
-        /// </summary>
-        public void Produce()
-        {   
-            Task<int> t = null;
-            while (q.Count > 0)
-            {
-                var request = q.Take();
-                Console.WriteLine(request.Command + " has entered the Produce function");
-                semaphore.Wait();
-
-                Console.WriteLine(request.Command + " has entered the semaphore");
-                t = c.runCommandAsync(request.Command);
-                tasks.Add(t);
-
-                t.ContinueWith((x) =>
-                {
-                    semaphore.Release();
-                    sum += x.Result;
-                    Console.WriteLine(request.Command + " has left the semaphore");
-                });
-            }
-        }
-
-
-        public void Dispose()
-        {
-            
-            semaphore.Dispose();
-            q.Dispose();
-            c.Dispose();
+            Task.Run(() => Produce());
         }
     }
 }
